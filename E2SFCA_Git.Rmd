@@ -1,0 +1,418 @@
+---
+title: "E2SFCA Code"
+author: "TW"
+date: "2025-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Package install/loads
+```{r}
+packages = c("dplyr",
+             "tidyr",
+             "sf",
+             "spdep",
+             "leaflet",
+             "tigris",
+             "censusapi",
+             "raster",
+             "terra",
+             "conflicted",
+             "data.table",
+             "crayon",
+             "tictoc",
+             "foreach")
+
+
+
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+
+#Functions
+```{r}
+#E2SFCA methods
+check_col_names_supply <- function(data) {
+  dt_req_cols <- c("HospName", "longitude", "latitude")
+  
+  # Check for missing required columns
+  missing_columns <- setdiff(dt_req_cols, names(data))
+  if (length(missing_columns) > 0) {
+    stop(paste("Missing required columns:", paste(missing_columns, collapse = ", ")))
+  }
+  
+  # Check for at least one numeric or integer column, excluding dt_req_cols
+  numeric_cols <- sapply(data[, !(names(data) %in% dt_req_cols)], is.numeric)
+  num_numeric_cols <- sum(numeric_cols)
+  if (num_numeric_cols == 0) {
+    stop("The dataset must contain at least one numeric or integer type column (excluding required columns).")
+  }
+  
+  return(paste("Supply dataset has the correct variable names and contains", num_numeric_cols, "numeric or integer type columns (potential supply variables)."))
+}
+
+check_col_names_dt <- function(data) {
+  dt_req_cols = c("range", "HospName", "geometry")
+  missing_columns <- setdiff(dt_req_cols, names(data))
+  if (length(missing_columns) > 0) {
+    stop(paste("Missing required columns:", paste(missing_columns, collapse = ", ")))
+  }
+  return("Drivetime dataset has the correct variable names")
+}
+
+check_raster_type <- function(data) {
+  raster_class = class(data)[1]
+  if (raster_class != "SpatRaster") {
+    stop(paste("Uploaded raster data may be in the incorrect format"))
+  }
+  return("Raster dataset is in the correct format")
+}
+
+check_countryshape <- function(data) {
+  n_row = dim(data)[1]
+  class_countryshape = class(data)[1]
+  if (n_row != 1) {
+    stop(paste("Shapefile for the location (country) is in the incorrect format. It should only have 1 row."))
+  }
+  if (class_countryshape != "sf") {
+    stop(paste("The country shapefile is in the incorrect format."))
+  }
+  return("The country shapefile has the correct format")
+}
+
+
+
+calculate_e2sfca <- function(prefix = "", #prefix for file naming/saving purposes
+                             output_folder_path, #save location for files. Will save in existing location or create a new folder if not found
+                             supply_dataset_name, #file name with path of supply dataset
+                             drivetime_dataset_name, #drivetime dataset with path
+                             raster_dataset_name, #tif raster file of population at 1km resolution with path
+                             country_shapefile_name, #country shape file location with path
+                             drivetimes, #drivetimes in minutes, ex: c(30, 60, 90)
+                             min_fdij, # value to set for the lowest fdij. must be between 0 and 0.9999, ex. fdij = 0.5
+                             supply_variables, #supply variables as a list ex. supply_variables = c("transfusion_count")
+                             crs_name #name of the CRS you will use for analysis. a projected coordinate system will keep distances consistent regardless of size of analysis
+){
+  tic("Total Runtime")
+  #uploading data
+  country_supply_df.pre = read.csv(supply_dataset_name) %>%
+    dplyr::filter(longitude != "#VALUE!") #SAT (supply) dataset
+  
+  #Drivetime shape files: shapefile containing the drivetimes for each scenario (each scenario being the minute-distances, for example 30,60,90,120 minutes). The dataset should have 3 columns: range, HospName, and geometry. range should be in seconds
+  dt_country_all = st_read(drivetime_dataset_name)
+  dt_country_all = st_transform(dt_country_all, crs = crs_name)
+  
+  #Population raster file: this population file has the population of the entire globe at 1km x 1km resolution
+  pop_raster = terra::rast(raster_dataset_name)
+  pop_raster_orig_sum = global(pop_raster, fun = "sum", na.rm = T)
+  cell_area_pop_raster_base = cellSize(pop_raster, unit = "km")
+  pop_density = pop_raster / cell_area_pop_raster_base
+  pop_raster = terra::project(pop_density, 
+                              crs_name,
+                              method = "bilinear",
+                              res = 1000)
+  cell_area_pop_raster_projected = cellSize(pop_raster, unit = "km")
+  pop_raster = pop_raster * cell_area_pop_raster_projected
+  pop_raster_post_projected_sum = global(pop_raster, fun = "sum", na.rm = T)
+  names(pop_raster) = "PopulationCount"
+  pop_raster_pcnt_diff = 100*(pop_raster_post_projected_sum - pop_raster_orig_sum)/pop_raster_orig_sum
+  
+  print(paste0("The provided raster has a population of ", 
+               round(pop_raster_orig_sum, digits = 0), ". After projection to crs of ", 
+               crs_name, 
+               " the population is ", 
+               round(pop_raster_post_projected_sum, digits = 0), 
+               ", which is a change of ", 
+               round(pop_raster_pcnt_diff, digits = 4), 
+               "%. The provided raster has a resolution of between ", 
+               round(pull(global(cell_area_pop_raster_base, fun = "min")), digits = 2),
+               " km2 and ",  
+               round(pull(global(cell_area_pop_raster_base, fun = "max")), digits = 2),
+               " km2, and the projected raster has a resolution of ", 
+               round(pull(global(cell_area_pop_raster_projected, fun = "mean", na.rm = T)), digits = 2), 
+               " km2."))
+  
+  #Country Shape file: simple shape of the country of interest
+  country_shape = sf::st_read(country_shapefile_name)
+  country_shape <- st_transform(country_shape, crs = st_crs(crs_name))#ensuring aligned crs
+  
+  country_shape_epsg = st_crs(country_shape)$epsg
+  raster_epsg <- gsub(".*ID\\[\"EPSG\",(\\d+)\\].*", "\\1", crs(pop_raster))
+  dt_epsg = st_crs(dt_country_all)$epsg
+  
+  # Print the EPSG codes
+print(paste("Country Shape EPSG:", country_shape_epsg))
+print(paste("Raster EPSG:", raster_epsg))
+print(paste("Drivetime EPSG:", dt_epsg))
+  
+  #Processing the population raster to crop it to the country extent and transform it to point data
+  masked_raster <- crop(pop_raster, country_shape, mask=TRUE) # Mask the raster using the sf object
+  masked_points_data <- st_as_sf(as.points(masked_raster, values=TRUE))#turning raster into point dataset
+  masked_points_data_2 <- masked_points_data %>%
+    mutate(loc_id = row_number()) 
+  
+#Join the drivetime dataset with the population raster, which will return the specific population zones that land within each drivetime polygon for each hospital
+  tic("Starting population join to drivetime polygons. This step can take a long time")
+  joined_data <- st_join(masked_points_data_2,
+                         dt_country_all,
+                         join = st_intersects,
+                         left = T) 
+  toc()
+  
+  rm(dt_country_all)
+  rm(pop_raster)
+  rm(country_shape)
+  rm(masked_raster)
+  rm(masked_points_data)
+  
+  tic("Data Prep")
+  
+  beta_ideal = -((max(drivetimes)-min(drivetimes))^2)*((log(exp(1))/(log(min_fdij))))
+  
+  #create a dataset with the drivetime seconds, beta, and associated Fdij. The Fdij is dependent on the drive time and beta, and beta is dependent on the beta_ideal calculation and thus the minimum set fdij (min_fdij)
+  fdij_vals <- data.frame(drivetime = drivetimes) %>% #set the drivetimes in seconds here
+    mutate(drivetime_smallest = min(drivetime)) %>%
+    mutate(beta = beta_ideal) %>%
+    mutate(fdij = exp(1)^(-((drivetime-drivetime_smallest)^2)/beta)) %>%
+    mutate(drivetime_seconds = drivetime*60) %>%
+    select(drivetime_seconds, beta, fdij)
+  
+  #------------------------------------------
+  #------------------------------------------
+  #------------------------------------------
+  
+  #Merging joined_data with the hospital specific factors (volume, number of surgeons, etc)
+  #joined_data is the demand dataset and the travel cost dataset already merged, without the weights yet
+  
+  #first, select the variables of interest
+  country_supply_df = country_supply_df.pre %>%
+    dplyr::select(HospName, all_of(supply_variables)) %>%
+    mutate(HospName = as.character(HospName)) %>% 
+    mutate(HospIndex = row_number())
+  rm(country_supply_df.pre)
+  
+  
+  #merging the supply and the demand dataset
+  e2s_country_df = as.data.table(country_supply_df)[joined_data, on = "HospName", nomatch = NA] #left join on country_supply_df
+  rm(joined_data)
+  
+  #first, merge the weights in by matching the drivetime zone
+  #then, renames some variables
+  # then filter out some rows that shouldnt be there (essentially, double counted). See below for reasons
+  e2s_country_df_2 = e2s_country_df %>%
+    merge(., fdij_vals, by.x = "range", by.y = "drivetime_seconds", all.x = T) %>%  #merges Wr with pop zones
+    dplyr::rename(pop_1km = PopulationCount,
+                  pop_1km_index = loc_id,
+                  hosp_name = HospName,
+                  hosp_index = HospIndex,
+                  subzone = range,
+                  weights = fdij) %>%
+    dplyr::select(pop_1km_index,
+                  pop_1km,
+                  hosp_index,
+                  hosp_name,
+                  subzone,
+                  weights) %>%
+    dplyr::filter(!is.na(hosp_index)) %>%
+    dplyr::mutate(hosp_subzone = paste0(hosp_index,"_",subzone)) %>% #creating the hospital_subzone index
+    dplyr::arrange(hosp_index, pop_1km_index, subzone) %>%
+    dplyr::group_by(hosp_index, pop_1km_index) %>%
+    dplyr::filter(subzone == min(subzone)) %>%
+    dplyr::ungroup() ### filter that will allow me to remove population zones that should not be in the calculation. I have 120, 60, and 30 minute drive times. If the pop zone is within the 30 minute drive time, it should be removed from the 2 other drive times. if it is in the 60 minute drive time and not in the 30 minute drivetime, it should be removed from the 120 minute drive time. If it is in the 120 minute drive time only, there should be no need to remove it. Essentially need to make sure that each population zone (pop_1km_index) is only represented once within each hosp_index by the lowest subzone. 
+  #output is a dataset with all population zones that are within at least 1 subzone of a hospital. It has the population in that zone, the weights for that hospital subzone
+  rm(e2s_country_df)
+  
+  #------------------------------------------
+  #------------------------------------------
+  #------------------------------------------
+  toc()
+  tic("SPAI Step 1")
+  print("Starting E2SFCA")
+  #Calculating the SPAI
+  
+  
+  #step 1
+  
+  e2s_step1.1.dt = as.data.table(e2s_country_df_2)[, weighted_sum := pop_1km * weights] #multiply each population "chunk" by the appropriate hospital subzone weight. Essentially calculate PK*Wr for every possible pair
+  
+  subzone_summary <- e2s_step1.1.dt[, .(
+    hosp_name = data.table::first(hosp_name),
+    hosp_index = data.table::first(hosp_index),
+    subzone = data.table::first(subzone), #these "first" functions just pulls forward the hospital name and subzones for later use
+    weighted_sum = sum(weighted_sum, na.rm = T) #summing step
+  ), by = hosp_subzone] #grouping step
+  rm(e2s_step1.1.dt)
+  
+  hospital_summary <- subzone_summary[, .(
+    hosp_name = data.table::first(hosp_name),
+    denom = sum(weighted_sum, na.rm = TRUE) #calculate the denominator by hospital
+  ), by = hosp_index] #grouping step, by hospital
+  rm(subzone_summary)
+  
+  e2s_step1.2 = as.data.frame(hospital_summary) %>%
+    merge(., country_supply_df, by.x = "hosp_index", by.y = "HospIndex") %>% #merging in supply
+    mutate(across(c(all_of(supply_variables)),
+                  ~ .x,
+                  .names = "Sj.{.col}")) %>% # Sj is defined as the supply
+    mutate(across(c(starts_with("Sj")),
+                  ~ .x/denom,
+                  .names = "Rj.{.col}")) %>%  #calculating Rj, or weighted provider to population ratio for each supply value
+    dplyr::select(-c(denom, HospName))
+  rm(country_supply_df)
+  rm(hospital_summary)
+  print("E2SFCA Step 1 Completed")
+  toc()
+  
+  
+  tic("Step 2")
+  print("Starting E2SFCA Step 2")
+  
+  #step 2
+  #2a
+  e2s_step2.1 = e2s_country_df_2 %>% #(e2s_country_df_2) gives us the individual chunk hospital_subzone assignments and weights. Step 1.2 gives the hospital specific Rj
+    left_join(e2s_step1.2, by = "hosp_index") #merge such that Rj is appended to the datasets with the pop zones and weights. Want to keep all of the pop zones so use left_join
+  rm(e2s_country_df_2)
+  
+  # Convert your data to data.table format
+  e2s_step2.1_dt <- as.data.table(e2s_step2.1)
+  rm(e2s_step2.1)
+  
+  #2b
+  rj_cols <- grep("^Rj", names(e2s_step2.1_dt), value = TRUE) # Define the Rj columns to be processed
+  e2s_step2.2_dt <- e2s_step2.1_dt[,
+                                   lapply(.SD, function(x) sum(x * weights, na.rm = TRUE)),
+                                   .SDcols = rj_cols,
+                                   by = pop_1km_index]# Calculate the weighted sums for each Rj_ column. Essentially a summarization step of the Rj * weights by pop_1km_index. Since this dataset only contains the population indexes that fall within a drivetime zone, and each weight Wr is already on the correct row with the corresponding subzone r, we can calculate Rj*Wr and add all of them together per chunk i (pop_1km_index)
+  rm(e2s_step2.1_dt)
+  
+  setnames(e2s_step2.2_dt, old = rj_cols, new = paste("SPAI", rj_cols, sep = ".")) # Rename columns to prefix them with 'SPAI.'
+  
+  #2c
+  # List of SPAI columns
+  spai_columns <- grep("SPAI", names(e2s_step2.2_dt), value = TRUE)
+  
+  # Loop to create SPAR columns for each SPAI. SPAR is calculated by dividing each SPAI by the mean SPAI
+  for (col in spai_columns) {
+    mean_value <- mean(e2s_step2.2_dt[[col]], na.rm = TRUE) # Calculate mean values (needed to calculate SPAR)
+    spar_colname <- sub("SPAI", "SPAR", col)
+    e2s_step2.2_dt[, (spar_colname) := get(col) / mean_value] # Calculate SPAR (SPAI divided by the mean SPAI)
+  }
+  
+  
+  # Convert back to data frame, add back the geometries
+  e2s_step2.3 <- as.data.frame(e2s_step2.2_dt) %>%
+    rename(loc_id = pop_1km_index) %>%
+    full_join(., masked_points_data_2, by = "loc_id") %>% #full join here so that we have NA rows, which will give the pop without access
+    mutate(across(c(starts_with("SPAI")), #SPAI equals the supply per person. 
+                  ~ .x*100000,
+                  .names = "per100k.{.col}")) %>%
+    mutate(across(c(starts_with("SPAI")),
+                  ~ .x*1000,
+                  .names = "per1k.{.col}")) %>%
+    mutate(across(c(starts_with("SPAI")),
+                  ~ (.x*PopulationCount),
+                  .names = "rawsupply_perblock.{.col}"))
+  
+  rm(masked_points_data_2)
+  rm(e2s_step2.2_dt)
+  
+  
+  #------------------------------------------
+  #------------------------------------------
+  #------------------------------------------
+  toc()
+  print("E2SFCA Step 2 Completed")
+  
+  tic("Gridding, Saving")
+  e2s_map.sf = st_as_sf(e2s_step2.3, crs = st_crs(crs_name))
+  rm(e2s_step2.3)
+ 
+#finding distances between cells in meters
+  distances <- list(0)# Initialize a vector to store distances
+  # Loop through consecutive pairs of loc_id values
+  loc_ids = e2s_map.sf$loc_id
+  for (i in 1:100) {
+  # Get geometries for loc_id == x and loc_id == x+1
+  geom_x <- e2s_map.sf[e2s_map.sf$loc_id == loc_ids[i], ]
+  geom_x_plus_1 <- e2s_map.sf[e2s_map.sf$loc_id == loc_ids[i + 1], ]
+  
+  # Calculate the distance between the two geometries
+  distances[i] <- st_distance(geom_x$geometry, geom_x_plus_1$geometry)
+  }
+  distances <- as.numeric(distances)# Convert distances to numeric
+  cell_size_actual <- min(distances)# Find the minimum distance
+  print(paste0("The cell size is ", cell_size_actual, " meters"))#
+  
+  
+  create_polygons <- function(sf_points, cellsize = cell_size_actual) {
+    # Ensure the coordinate reference system is projected (e.g., UTM)
+    if (st_crs(sf_points)$units_gdal != "metre") {
+      stop("The CRS should be in meters for accurate distance calculations.")
+    }
+    
+    # Create a data.table from the sf object
+    dt <- data.table(st_coordinates(sf_points))
+    attributes <- data.table(st_drop_geometry(sf_points))
+    
+    # Combine coordinates and attributes
+    dt <- cbind(dt, attributes)
+    
+    # Define the bounding box for each point
+    dt[, `:=`(xmin = X - cellsize / 2, xmax = X + cellsize / 2,
+              ymin = Y - cellsize / 2, ymax = Y + cellsize / 2)]
+    
+    # Create polygons from bounding boxes
+    polygons <- lapply(1:nrow(dt), function(i) {
+      st_polygon(list(matrix(c(dt$xmin[i], dt$ymin[i],
+                               dt$xmax[i], dt$ymin[i],
+                               dt$xmax[i], dt$ymax[i],
+                               dt$xmin[i], dt$ymax[i],
+                               dt$xmin[i], dt$ymin[i]),
+                             ncol = 2, byrow = TRUE)))
+    })
+    
+    # Convert to sf object with attributes
+    sf_polygons <- st_sf(attributes, geometry = st_sfc(polygons, crs = st_crs(sf_points)))
+    return(sf_polygons)
+  }
+  
+  
+  e2s_map.sf.correct_utm <- st_transform(e2s_map.sf, crs = crs_name)
+  rm(e2s_map.sf)
+  
+  e2s_map.sf2 = create_polygons(e2s_map.sf.correct_utm) %>% 
+    mutate(row_index = row_number()) 
+  rm(e2s_map.sf.correct_utm)
+  rj_file = st_drop_geometry(e2s_step1.2)
+  rm(e2s_step1.2)
+  
+  # Check if the folder exists; if not, create it
+  if (!dir.exists(output_folder_path)) {
+    dir.create(output_folder_path, recursive = TRUE)
+  }
+  
+  # Update file paths to use the specified output folder
+  rj_file_dsn <- file.path(output_folder_path, paste0(prefix, "rj.", "fdij", min_fdij, ".step1.csv"))
+  e2s_map.sf2_dsn = file.path(output_folder_path, paste0(prefix, "spai.", "fdij", min_fdij, ".fulldataset.geojson"))
+ 
+  # Save the results
+  write.csv(rj_file, file = rj_file_dsn, row.names = FALSE) #csv file with step 1 output, aka hospital based values
+  st_write(e2s_map.sf2, dsn = e2s_map.sf2_dsn, driver = "GeoJSON", append = F) #geojson file with final output, vars and polygons
+  
+  
+  toc()
+  toc()
+}
+```
