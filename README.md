@@ -11,5 +11,5 @@ This repository contains R code that can be used to generate E2SFCA estimates. T
 # "Supply" Dataset
 Included is the hospital supply data used for this publication. In order to use supply data with the above code, it must follow a specific structure. There should be one hospital per row, with columns including a hospital identifier, the coordinates of the hospital, and any number of supply variables as an integer. In this case, the supply variables are the number of SAO providers and the number of surgical procedures. In order to ensure privacy for individual hospitals and individual providers, we follow HCUP guidelines in making this data available to the public. This includes removal of coordinates (which could geolocate facilities specifically) and censoring supply fields that are less than or equal to 10. There are plans for publication of the full, unrestricted dataset with public publication of the national surgical plan of Ecuador. When this is done, the dataset will be updated.
 
-# E2SFCA Output Dataset
+# Output Dataset
 Include is the output of the E2SFCA process. The dataset includes over 250000 datapoints representing the geospatial access to surgery in Ecuador. The variables "SPAI.Rj.Sj.WorkforceSAO" and	"SPAI.Rj.Sj.VolumeSurgical" represent the access, as "Spatial Access Index" or "SPAI", to the supply variables used in this study.
