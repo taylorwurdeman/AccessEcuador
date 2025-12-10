@@ -1,6 +1,11 @@
 # Introduction
 Github repository for data and code used in the manuscript "Access to Surgery in Ecuador using the Enhanced 2-step Floating Catchment Area Approach". Included is 3 main files, outlined in detail below.
 
+Additional publicly available data is required for the E2SFCA process. This includes a population raster, drivetime polygons, and a country shapefile. These are linked below.
+Population raster: Gridded Population of the World Version 4. Available from: http://dx.doi.org/10.7927/H49C6VHW
+Drivetime polygon: Using hereR, which relies on HERE API. Drivetime polygons must be calculated from hospital coordinates. Additional details on using hereR is found in the manuscript. Package details available from https://munterfi.r-universe.dev/hereR.
+Country shapefile: geoBoundaries. Available from https://www.geoboundaries.org/countryDownloads.html.
+
 Once the manuscript has been published, a link will be provided in the README. Any use of this code should be cited. The supply data and E2SFCA output data is included for data transparency and should not be used without express consent of the authors.
 
 # E2SFCA Code
